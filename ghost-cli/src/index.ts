@@ -1,5 +1,3 @@
-import * as path from 'node:path';
-import * as fs from 'node:fs/promises';
 import pinoPretty from 'pino-pretty';
 import pino from 'pino';
 import { LocalConfig } from './config.js';
@@ -7,22 +5,13 @@ import {
   setLogger,
   buildWalletFromSeed,
   mnemonicToSeed,
-  configureProviders,
-  deploy,
-  joinContract,
-  getLedgerState,
   waitForSync,
   waitForFunds,
-  ghostDeposit,
-  ghostSubmitLend,
-  ghostSubmitBorrow,
-  ghostRevealLend,
-  ghostRevealBorrow,
-  ghostSettle,
-  ghostRepay,
-  ghostAdvancePhase,
-} from './api.js';
-import { computeCommitment } from '@ghost/ghost-contract';
+  sendUnshieldedTransfer,
+  fundWalletFromGenesis,
+  type WalletContext,
+} from './wallet-api.js';
+import { loadMnemonic, saveMnemonic } from './wallet-store.js';
 import * as readline from 'node:readline';
 
 const config = new LocalConfig();
@@ -35,143 +24,151 @@ const logger = pino(
 );
 setLogger(logger);
 
-// Genesis seed — matches midnight-local-dev master wallet
-const GENESIS_SEED = '0000000000000000000000000000000000000000000000000000000000000001';
-// Alice mnemonic from midnight-local-dev/accounts.json
-const ALICE_MNEMONIC = 'young popular balance act bean merry green bulk become south tank magnet real pride leopard noodle wild hurdle tissue jump city blur spring emerge';
-
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q: string) => new Promise<string>((r) => rl.question(q, r));
 
-async function main() {
-  logger.info('═══ GHOST Finance — Localnet Deployment ═══');
-
-  // Build wallet from Alice's mnemonic
-  logger.info('Building wallet from Alice mnemonic...');
-  const seed = await mnemonicToSeed(ALICE_MNEMONIC);
-  const walletContext = await buildWalletFromSeed(seed, config);
-
-  logger.info('Waiting for wallet sync...');
-  await waitForSync(walletContext.wallet);
-
-  logger.info('Waiting for funds...');
-  await waitForFunds(walletContext.wallet);
-
-  logger.info('Configuring providers...');
-  const providers = await configureProviders(walletContext, config);
-
-  // Get operator key (32 bytes from wallet public key)
-  const state = await walletContext.wallet.state().pipe().toPromise();
-  const operatorKey = new Uint8Array(32); // placeholder — in production derive from wallet
-
-  logger.info('Deploying GHOST contract...');
-  const contract = await deploy(providers, operatorKey);
-  const contractAddress = contract.deployTxData.public.contractAddress;
-
-  logger.info('');
-  logger.info(`Contract deployed at: ${contractAddress}`);
-  logger.info('');
-
-  // Show initial state
-  const ledgerState = await getLedgerState(providers, contractAddress);
-  if (ledgerState) {
-    logger.info(`Phase: ${ledgerState.phase}`);
-    logger.info(`Epoch: ${ledgerState.epoch_num}`);
-    logger.info(`Total deposits: ${ledgerState.total_deposits}`);
+async function getMnemonic(): Promise<string> {
+  const stored = await loadMnemonic();
+  if (stored) {
+    logger.info('Found saved mnemonic');
+    return stored;
   }
 
-  // Interactive menu
+  console.log('\n═══ Wallet Setup ═══');
+  console.log('Enter your 24-word mnemonic phrase (words separated by spaces):');
+  const input = await ask('> ');
+  const mnemonic = input.trim();
+
+  // Validate via mnemonicToSeed (throws if invalid)
+  await mnemonicToSeed(mnemonic);
+
+  await saveMnemonic(mnemonic);
+  logger.info('Mnemonic saved to ~/.ghost/wallet.json');
+  return mnemonic;
+}
+
+async function displayWalletInfo(walletContext: WalletContext) {
+  const state = await walletContext.wallet.state().pipe().toPromise();
+
+  // Get unshielded address using getBech32Address
+  const unshieldedAddr = walletContext.unshieldedKeystore.getBech32Address().asString();
+
+  console.log('\n╔════════════════════════════════════════════════════════════╗');
+  console.log('║                    GHOST CLI Wallet                        ║');
+  console.log('╠════════════════════════════════════════════════════════════╣');
+  console.log(`║ Unshielded Address: ${unshieldedAddr}`);
+  console.log(`║ Network: ${config.node}`);
+  console.log('╠════════════════════════════════════════════════════════════╣');
+  console.log('║ Balances:');
+  console.log(`║   Shielded:   ${(state as any)?.shielded?.balances[require('@midnight-ntwrk/ledger-v7').nativeToken().raw] || 0n} (private)`);
+  console.log(`║   Unshielded: ${(state as any)?.unshielded?.balances[require('@midnight-ntwrk/ledger-v7').nativeToken().raw] || 0n} (public)`);
+  console.log(`║   Dust:       ${(state as any)?.dust?.balance || 0n} (fees)`);
+  console.log('╚════════════════════════════════════════════════════════════╝\n');
+}
+
+async function handleSend(walletContext: WalletContext) {
+  const recipient = await ask('Recipient address: ');
+  const amount = await ask('Amount (in microNIGHT, 1 NIGHT = 1,000,000): ');
+
+  try {
+    await sendUnshieldedTransfer(walletContext, recipient, BigInt(amount));
+    console.log('✓ Transfer successful!');
+  } catch (e: any) {
+    logger.error(`Transfer failed: ${e.message}`);
+  }
+}
+
+async function handleReceive(walletContext: WalletContext) {
+  const address = walletContext.unshieldedKeystore.getBech32Address().asString();
+  console.log('\n╔════════════════════════════════════════════════════════════╗');
+  console.log('║                   Your Receive Address                     ║');
+  console.log('╠════════════════════════════════════════════════════════════╣');
+  console.log(`║ ${address}`);
+  console.log('╚════════════════════════════════════════════════════════════╝\n');
+}
+
+async function handleFundWallet(walletContext: WalletContext) {
+  const amount = await ask('Amount to fund (in microNIGHT, default 50000000000 = 50k NIGHT): ');
+  const fundAmount = amount.trim() ? BigInt(amount) : 50_000_000_000n;
+
+  try {
+    const address = walletContext.unshieldedKeystore.getBech32Address().asString();
+    await fundWalletFromGenesis(address, fundAmount, config);
+    console.log('✓ Wallet funded successfully!');
+  } catch (e: any) {
+    logger.error(`Funding failed: ${e.message}`);
+  }
+}
+
+async function handleLend(walletContext: WalletContext) {
+  const amount = await ask('Lend amount: ');
+  const rate = await ask('Min rate (basis points): ');
+
+  // TODO: Implement lend flow
+  logger.info('Lend not yet implemented');
+}
+
+async function handleBorrow(walletContext: WalletContext) {
+  const amount = await ask('Borrow amount: ');
+  const rate = await ask('Max rate (basis points): ');
+  const collateral = await ask('Collateral amount: ');
+
+  // TODO: Implement borrow flow
+  logger.info('Borrow not yet implemented');
+}
+
+async function main() {
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('           GHOST Finance CLI - Midnight Network            ');
+  console.log('═══════════════════════════════════════════════════════════\n');
+
+  const mnemonic = await getMnemonic();
+
+  logger.info('Building wallet...');
+  const seed = await mnemonicToSeed(mnemonic);
+  const walletContext = await buildWalletFromSeed(seed, config);
+
+  logger.info('Syncing wallet...');
+  await waitForSync(walletContext.wallet);
+
+  logger.info('Checking funds...');
+  await waitForFunds(walletContext.wallet);
+
+  await displayWalletInfo(walletContext);
+
   let running = true;
   while (running) {
-    console.log('\n─── GHOST Finance Menu ───');
-    console.log('1. Deposit');
-    console.log('2. Submit Lend Bid');
-    console.log('3. Submit Borrow Bid');
-    console.log('4. Advance Phase');
-    console.log('5. Reveal Lend');
-    console.log('6. Reveal Borrow');
-    console.log('7. Settle Match');
-    console.log('8. Repay Loan');
-    console.log('9. View State');
+    console.log('─────────────────── Main Menu ───────────────────────');
+    console.log('1. Lend');
+    console.log('2. Borrow');
+    console.log('3. Send');
+    console.log('4. Receive');
+    console.log('5. Fund Wallet (localnet only)');
+    console.log('6. Refresh Wallet Info');
     console.log('0. Exit');
 
     const choice = await ask('\nChoice: ');
 
     try {
       switch (choice.trim()) {
-        case '1': {
-          const amt = await ask('Amount: ');
-          await ghostDeposit(contract, operatorKey, BigInt(amt));
+        case '1':
+          await handleLend(walletContext);
           break;
-        }
-        case '2': {
-          const nonce = crypto.getRandomValues(new Uint8Array(32));
-          const amt = await ask('Lend amount: ');
-          const rate = await ask('Min rate (basis points): ');
-          const commitment = computeCommitment(BigInt(amt), BigInt(rate), nonce, operatorKey);
-          await ghostSubmitLend(contract, commitment);
-          logger.info(`Commitment: ${Buffer.from(commitment).toString('hex')}`);
-          logger.info(`Save nonce: ${Buffer.from(nonce).toString('hex')} (needed for reveal)`);
+        case '2':
+          await handleBorrow(walletContext);
           break;
-        }
-        case '3': {
-          const nonce = crypto.getRandomValues(new Uint8Array(32));
-          const amt = await ask('Borrow amount: ');
-          const rate = await ask('Max rate (basis points): ');
-          const commitment = computeCommitment(BigInt(amt), BigInt(rate), nonce, operatorKey);
-          await ghostSubmitBorrow(contract, commitment);
-          logger.info(`Commitment: ${Buffer.from(commitment).toString('hex')}`);
-          logger.info(`Save nonce: ${Buffer.from(nonce).toString('hex')} (needed for reveal)`);
+        case '3':
+          await handleSend(walletContext);
           break;
-        }
-        case '4': {
-          await ghostAdvancePhase(contract, operatorKey);
+        case '4':
+          await handleReceive(walletContext);
           break;
-        }
-        case '5': {
-          const commitHex = await ask('Commitment (hex): ');
-          const amt = await ask('Amount: ');
-          const rate = await ask('Min rate (bps): ');
-          await ghostRevealLend(contract, Buffer.from(commitHex, 'hex'), operatorKey, BigInt(amt), BigInt(rate));
+        case '5':
+          await handleFundWallet(walletContext);
           break;
-        }
-        case '6': {
-          const commitHex = await ask('Commitment (hex): ');
-          const amt = await ask('Amount: ');
-          const rate = await ask('Max rate (bps): ');
-          const col = await ask('Collateral: ');
-          await ghostRevealBorrow(contract, Buffer.from(commitHex, 'hex'), operatorKey, BigInt(amt), BigInt(rate), BigInt(col));
+        case '6':
+          await displayWalletInfo(walletContext);
           break;
-        }
-        case '7': {
-          const rate = await ask('Clearing rate (bps): ');
-          const ls = await ask('Lend slot: ');
-          const bs = await ask('Borrow slot: ');
-          const ma = await ask('Match amount: ');
-          await ghostSettle(contract, BigInt(rate), BigInt(ls), BigInt(bs), BigInt(ma));
-          break;
-        }
-        case '8': {
-          const lid = await ask('Loan ID: ');
-          const td = await ask('Total due: ');
-          await ghostRepay(contract, BigInt(lid), operatorKey, BigInt(td));
-          break;
-        }
-        case '9': {
-          const s = await getLedgerState(providers, contractAddress);
-          if (s) {
-            console.log(`\nPhase: ${s.phase} (0=BID,1=REVEAL,2=CLEAR,3=ACTIVE)`);
-            console.log(`Epoch: ${s.epoch_num}`);
-            console.log(`Lend bids: ${s.lend_count}`);
-            console.log(`Borrow bids: ${s.borrow_count}`);
-            console.log(`Clearing rate: ${s.clearing_rate} bps`);
-            console.log(`Matched volume: ${s.matched_volume}`);
-            console.log(`Loans: ${s.loan_count}`);
-            console.log(`Total deposits: ${s.total_deposits}`);
-            console.log(`Total locked: ${s.total_locked}`);
-          }
-          break;
-        }
         case '0':
           running = false;
           break;
@@ -185,7 +182,7 @@ async function main() {
 
   rl.close();
   logger.info('Shutting down...');
-  await walletContext.wallet.close();
+  // Note: WalletFacade in SDK v1 doesn't have close() method
   process.exit(0);
 }
 

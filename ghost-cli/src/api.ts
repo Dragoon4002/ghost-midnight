@@ -27,6 +27,7 @@ import {
 import {
   createKeystore,
   InMemoryTransactionHistoryStorage,
+  PublicKey,
   type UnshieldedKeystore,
   UnshieldedWallet,
 } from '@midnight-ntwrk/wallet-sdk-unshielded-wallet';
@@ -76,65 +77,62 @@ export const mnemonicToSeed = async (mnemonic: string): Promise<string> => {
 };
 
 const deriveKeysFromSeed = (seed: string) => {
-  const hdWallet = HDWallet.fromSeed(Buffer.from(seed, 'hex'));
-  if (hdWallet.type !== 'seedOk') {
-    throw new Error('Failed to initialize HDWallet from seed');
+  const hdResult = HDWallet.fromSeed(Buffer.from(seed, 'hex'));
+  if (hdResult.type !== 'seedOk') {
+    throw new Error('Failed to derive keys from seed');
   }
+
+  const account = hdResult.hdWallet.selectAccount(0);
+
+  function deriveRoleKey(accountKey: any, role: number, index = 0): Buffer {
+    const result = accountKey.selectRole(role).deriveKeyAt(index);
+    if (result.type === 'keyDerived') return Buffer.from(result.key);
+    return deriveRoleKey(accountKey, role, index + 1);
+  }
+
+  const zswapSeed = deriveRoleKey(account, Roles.Zswap);
+  const dustSeed = deriveRoleKey(account, Roles.Dust);
+  const unshieldedKey = deriveRoleKey(account, Roles.NightExternal);
+
+  hdResult.hdWallet.clear();
+
   return {
-    zswapKeys: hdWallet.deriveKeyPair(0, 0, Roles.Zswap),
-    nightExternalKeys: hdWallet.deriveKeyPair(0, 0, Roles.NightExternal),
-    dustKeys: hdWallet.deriveKeyPair(0, 0, Roles.Dust),
+    zswapSeed,
+    dustSeed,
+    unshieldedKey,
   };
 };
-
-const buildShieldedConfig = ({ indexer, indexerWS, node, proofServer }: Config) => ({
-  networkId: getNetworkId(),
-  indexerClientConnection: { indexerHttpUrl: indexer, indexerWsUrl: indexerWS },
-  provingServerUrl: new URL(proofServer),
-  relayURL: new URL(node.replace(/^http/, 'ws')),
-});
-
-const buildUnshieldedConfig = ({ indexer, indexerWS }: Config) => ({
-  networkId: getNetworkId(),
-  indexerClientConnection: { indexerHttpUrl: indexer, indexerWsUrl: indexerWS },
-  txHistoryStorage: new InMemoryTransactionHistoryStorage(),
-});
-
-const buildDustConfig = ({ indexer, indexerWS, node, proofServer }: Config) => ({
-  networkId: getNetworkId(),
-  costParameters: { additionalFeeOverhead: 300_000_000_000_000n, feeBlocksMargin: 5 },
-  indexerClientConnection: { indexerHttpUrl: indexer, indexerWsUrl: indexerWS },
-  provingServerUrl: new URL(proofServer),
-  relayURL: new URL(node.replace(/^http/, 'ws')),
-});
 
 export const buildWalletFromSeed = async (seed: string, config: Config): Promise<WalletContext> => {
   const keys = deriveKeysFromSeed(seed);
 
-  const shieldedWallet = await ShieldedWallet.buildShieldedWallet(
-    buildShieldedConfig(config),
-    keys.zswapKeys.secretKey,
-    keys.zswapKeys.publicKey,
-  );
-  const unshieldedKeystore = createKeystore(keys.nightExternalKeys.secretKey);
-  const unshieldedWallet = UnshieldedWallet.buildUnshieldedWallet(
-    buildUnshieldedConfig(config),
-    unshieldedKeystore,
-  );
-  const dustWallet = await DustWallet.buildDustWallet(
-    buildDustConfig(config),
-    keys.dustKeys.secretKey,
-    keys.dustKeys.publicKey,
-  );
+  const shieldedKeys = ledger.ZswapSecretKeys.fromSeed(keys.zswapSeed);
+  const dustKey = ledger.DustSecretKey.fromSeed(keys.dustSeed);
+  const unshieldedKeystore = createKeystore(keys.unshieldedKey, getNetworkId());
 
-  const wallet = await WalletFacade.build(shieldedWallet, unshieldedWallet, dustWallet);
-
-  return {
-    wallet,
-    shieldedSecretKeys: keys.zswapKeys.secretKey,
-    dustSecretKey: keys.dustKeys.secretKey,
-    unshieldedKeystore,
+  const configuration = {
+    networkId: getNetworkId(),
+    costParameters: {
+      additionalFeeOverhead: 300_000_000_000_000n,
+      feeBlocksMargin: 5,
+    },
+    relayURL: new URL(config.node.replace(/^http/, 'ws')),
+    provingServerUrl: new URL(config.proofServer),
+    indexerClientConnection: {
+      indexerHttpUrl: config.indexer,
+      indexerWsUrl: config.indexerWS,
+    },
+    txHistoryStorage: new InMemoryTransactionHistoryStorage(),
   };
+
+  const shieldedWallet = ShieldedWallet(configuration).startWithSecretKeys(shieldedKeys);
+  const unshieldedWallet = UnshieldedWallet(configuration).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore));
+  const dustWallet = DustWallet(configuration).startWithSecretKey(dustKey, ledger.LedgerParameters.initialParameters().dust);
+
+  const wallet = new WalletFacade(shieldedWallet, unshieldedWallet, dustWallet);
+  await wallet.start(shieldedKeys, dustKey);
+
+  return { wallet, shieldedSecretKeys: shieldedKeys, dustSecretKey: dustKey, unshieldedKeystore };
 };
 
 export const buildFreshWallet = async (config: Config): Promise<WalletContext> => {
@@ -386,4 +384,68 @@ export const ghostAdvancePhase = async (
   logger.info(`Advancing phase...`);
   const result = await contract.callTx.advance_phase(caller);
   return result;
+};
+
+// ─── Wallet Operations ─────────────────────────────────────────────
+
+export const sendUnshieldedTransfer = async (
+  walletContext: WalletContext,
+  recipientAddress: string,
+  amount: bigint,
+): Promise<void> => {
+  logger.info(`Sending ${amount} to ${recipientAddress}...`);
+
+  const recipe = await walletContext.wallet.transferTransaction(
+    [
+      {
+        type: 'unshielded',
+        outputs: [
+          {
+            amount,
+            receiverAddress: recipientAddress,
+            type: ledger.unshieldedToken().raw,
+          },
+        ],
+      },
+    ],
+    {
+      shieldedSecretKeys: walletContext.shieldedSecretKeys,
+      dustSecretKey: walletContext.dustSecretKey,
+    },
+    {
+      ttl: new Date(Date.now() + 30 * 60 * 1000),
+    },
+  );
+
+  const signedRecipe = await walletContext.wallet.signRecipe(
+    recipe,
+    (payload: Uint8Array) => walletContext.unshieldedKeystore.signData(payload),
+  );
+
+  const finalizedTx = await walletContext.wallet.finalizeRecipe(signedRecipe);
+  await walletContext.wallet.submitTransaction(finalizedTx);
+
+  logger.info('Transfer submitted successfully');
+};
+
+export const fundWalletFromGenesis = async (
+  recipientAddress: string,
+  amount: bigint,
+  config: Config,
+): Promise<void> => {
+  logger.info('Funding wallet from genesis account...');
+
+  // Genesis seed from localnet
+  const GENESIS_SEED = '0000000000000000000000000000000000000000000000000000000000000001';
+
+  // Build genesis wallet
+  const genesisWallet = await buildWalletFromSeed(GENESIS_SEED, config);
+  await waitForSync(genesisWallet.wallet);
+
+  // Transfer to recipient
+  await sendUnshieldedTransfer(genesisWallet, recipientAddress, amount);
+
+  // Note: WalletFacade in SDK v1 doesn't have close() method
+
+  logger.info('Funding complete');
 };
