@@ -1,0 +1,5 @@
+node_modules/
+wallet.json
+deployment.json
+.midnight-level-db/
+ghost-private-state/

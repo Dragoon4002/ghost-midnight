@@ -37,6 +37,7 @@ export class GhostSimulator {
   constructor(privateState: GhostPrivateState) {
     this.contract = new Contract<GhostPrivateState>(witnesses);
     this.contractAddress = sampleContractAddress();
+    const adminBytes = new Uint8Array(Buffer.from(privateState.ownerKey as unknown as string, 'hex'));
     const {
       currentPrivateState,
       currentContractState,
@@ -45,7 +46,8 @@ export class GhostSimulator {
       createConstructorContext(
         { ownerKey: privateState.ownerKey },
         toHexPadded("deployer")
-      )
+      ),
+      adminBytes
     );
     this.circuitContext = {
       currentPrivateState,
@@ -107,57 +109,63 @@ export class GhostSimulator {
     return this.getLedger();
   }
 
+  private ownerBytes(): Uint8Array {
+    const key = this.circuitContext.currentPrivateState.ownerKey;
+    if (key instanceof Uint8Array) return key;
+    return new Uint8Array(Buffer.from(key as unknown as string, 'hex'));
+  }
+
   // ─── Circuit Wrappers ───────────────────────────────────────────
 
   deposit(amount: bigint): Ledger {
-    const results = this.contract.impureCircuits.deposit(this.circuitContext, amount);
+    const results = this.contract.impureCircuits.deposit(this.circuitContext, this.ownerBytes(), amount);
     return this.applyResult(results);
   }
 
   withdraw(amount: bigint): Ledger {
-    const results = this.contract.impureCircuits.withdraw(this.circuitContext, amount);
+    const results = this.contract.impureCircuits.withdraw(this.circuitContext, this.ownerBytes(), amount);
     return this.applyResult(results);
   }
 
-  submitLend(commitment: string): Ledger {
+  submitLend(commitment: Uint8Array): Ledger {
     const results = this.contract.impureCircuits.submit_lend(this.circuitContext, commitment);
     return this.applyResult(results);
   }
 
-  submitBorrow(commitment: string): Ledger {
+  submitBorrow(commitment: Uint8Array): Ledger {
     const results = this.contract.impureCircuits.submit_borrow(this.circuitContext, commitment);
     return this.applyResult(results);
   }
 
-  revealLend(commitment: string, amount: bigint, rMin: bigint, nonce: string): Ledger {
+  revealLend(commitment: Uint8Array, amount: bigint, rMin: bigint, _nonce?: unknown): Ledger {
     const results = this.contract.impureCircuits.reveal_lend(
-      this.circuitContext, commitment, amount, rMin, nonce
+      this.circuitContext, commitment, this.ownerBytes(), amount, rMin
     );
     return this.applyResult(results);
   }
 
   revealBorrow(
-    commitment: string, amount: bigint, rMax: bigint,
-    collateral: bigint, nonce: string
+    commitment: Uint8Array, amount: bigint, rMax: bigint,
+    collateral: bigint, _nonce?: unknown
   ): Ledger {
     const results = this.contract.impureCircuits.reveal_borrow(
-      this.circuitContext, commitment, amount, rMax, collateral, nonce
+      this.circuitContext, commitment, this.ownerBytes(), amount, rMax, collateral
     );
     return this.applyResult(results);
   }
 
-  clearEpoch(): Ledger {
-    const results = this.contract.impureCircuits.clear_epoch(this.circuitContext);
+  settle(rate: bigint, lendSlot: bigint, borrowSlot: bigint, matchAmount: bigint): Ledger {
+    const results = this.contract.impureCircuits.settle(this.circuitContext, rate, lendSlot, borrowSlot, matchAmount);
     return this.applyResult(results);
   }
 
-  repay(loanId: bigint): Ledger {
-    const results = this.contract.impureCircuits.repay(this.circuitContext, loanId);
+  repay(loanId: bigint, caller: Uint8Array, totalDue: bigint): Ledger {
+    const results = this.contract.impureCircuits.repay(this.circuitContext, loanId, caller, totalDue);
     return this.applyResult(results);
   }
 
   advancePhase(): Ledger {
-    const results = this.contract.impureCircuits.advance_phase(this.circuitContext);
+    const results = this.contract.impureCircuits.advance_phase(this.circuitContext, this.ownerBytes());
     return this.applyResult(results);
   }
 }

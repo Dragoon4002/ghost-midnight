@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "midnight-contract-deployment": {
+      "source": "soumyacodes007/Midnight-deploy-cli",
+      "sourceType": "github",
+      "computedHash": "49926354824a854adce955911d077c31cbbf68704e65efe5a8df0de8a5343254"
+    }
+  }
+}

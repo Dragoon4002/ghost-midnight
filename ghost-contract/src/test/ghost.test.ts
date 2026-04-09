@@ -107,8 +107,13 @@ describe("GHOST Finance", () => {
       // ── Advance to CLEAR ──
       sim.as("lender1").advancePhase();
 
-      // ── CLEARING: compute r* and create loans ──
-      ledger = sim.as("lender1").clearEpoch();
+      // ── CLEARING: settle matched pairs (r=300 is optimal clearing rate) ──
+      // lend slot 0 = lender1 (5000, rMin=300), borrow slot 0 = borrower1 (4000, rMax=600)
+      // lend slot 0 = lender1 (5000, rMin=300), borrow slot 1 = borrower2 (2000, rMax=400)
+      sim.as("lender1").settle(300n, 0n, 0n, 4000n); // lender1 ↔ borrower1
+      sim.as("lender1").settle(300n, 0n, 1n, 1000n); // lender1 ↔ borrower2 (partial)
+      sim.as("lender1").advancePhase(); // CLEAR → ACTIVE
+      ledger = sim.getLedger();
 
       logger.info({
         section: "Clearing Results",
@@ -118,17 +123,6 @@ describe("GHOST Finance", () => {
         phase: ledger.phase
       });
 
-      // Clearing rate analysis:
-      // Candidate rates: 300 (lender1 r_min), 500 (lender2 r_min)
-      //
-      // At r=300: supply = 5000 (lender1), demand = 4000+2000=6000 (both borrowers)
-      //           matched = min(5000, 6000) = 5000
-      //
-      // At r=500: supply = 5000+3000=8000, demand = 4000 (only borrower1, r_max=600>=500)
-      //           borrower2 r_max=400 < 500, excluded
-      //           matched = min(8000, 4000) = 4000
-      //
-      // Best: r=300 with volume=5000
       expect(ledger.clearing_rate).toEqual(300n);
       expect(ledger.phase).toEqual(3n); // ACTIVE
 
@@ -163,7 +157,7 @@ describe("GHOST Finance", () => {
       // 1000 amount with only 1000 collateral (100%, needs 150%)
       const commit = computeCommitment(1000n, 500n, nonce, borrower1Key);
       sim.as("borrower1").submitBorrow(commit);
-      sim.as("borrower1").advancePhase(); // REVEAL
+      sim.as("lender1").advancePhase(); // REVEAL (only operator can advance)
       expect(() =>
         sim.as("borrower1").revealBorrow(commit, 1000n, 500n, 1000n, nonce)
       ).toThrow();

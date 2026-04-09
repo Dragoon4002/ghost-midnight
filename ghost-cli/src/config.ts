@@ -13,14 +13,18 @@ export interface Config {
   readonly indexerWS: string;
   readonly node: string;
   readonly proofServer: string;
+  readonly serverUrl: string;
+  readonly matchPollMs: number;
 }
 
 export class LocalConfig implements Config {
   logDir = path.resolve(currentDir, '..', 'logs', `${new Date().toISOString()}.log`);
-  indexer = 'http://127.0.0.1:8088/api/v3/graphql';
-  indexerWS = 'ws://127.0.0.1:8088/api/v3/graphql/ws';
+  indexer = 'http://127.0.0.1:8087/api/v3/graphql';
+  indexerWS = 'ws://127.0.0.1:8087/api/v3/graphql/ws';
   node = 'http://127.0.0.1:9944';
   proofServer = 'http://127.0.0.1:6300';
+  serverUrl = process.env.GHOST_SERVER_URL ?? 'http://localhost:8080';
+  matchPollMs = Number(process.env.GHOST_MATCH_POLL_MS ?? 5000);
   constructor() {
     setNetworkId('undeployed');
   }

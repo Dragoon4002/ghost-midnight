@@ -42,8 +42,10 @@ export const mnemonicToSeed = async (mnemonic: string): Promise<string> => {
   if (!bip39.validateMnemonic(words.join(' '), english)) {
     throw new Error('Invalid mnemonic phrase');
   }
+  // Full 64-byte BIP-39 seed — matches midnight-local-dev. Truncating
+  // to 32 bytes yields a different HD derivation and wallet address.
   const seed = await bip39.mnemonicToSeed(words.join(' '));
-  return Buffer.from(seed).subarray(0, 32).toString('hex');
+  return Buffer.from(seed).toString('hex');
 };
 
 const deriveKeysFromSeed = (seed: string) => {
@@ -52,24 +54,25 @@ const deriveKeysFromSeed = (seed: string) => {
     throw new Error('Failed to derive keys from seed');
   }
 
-  const account = hdResult.hdWallet.selectAccount(0);
+  // Match midnight-local-dev derivation exactly: batch-derive all roles at
+  // index 0 in a single call. The previous recursive retry at index+1
+  // produced different addresses than the canonical local-dev derivation.
+  const derivationResult = hdResult.hdWallet
+    .selectAccount(0)
+    .selectRoles([Roles.Zswap, Roles.NightExternal, Roles.Dust])
+    .deriveKeysAt(0);
 
-  function deriveRoleKey(accountKey: any, role: number, index = 0): Buffer {
-    const result = accountKey.selectRole(role).deriveKeyAt(index);
-    if (result.type === 'keyDerived') return Buffer.from(result.key);
-    return deriveRoleKey(accountKey, role, index + 1);
+  if (derivationResult.type !== 'keysDerived') {
+    throw new Error(`Failed to derive keys: ${derivationResult.type}`);
   }
 
-  const zswapSeed = deriveRoleKey(account, Roles.Zswap);
-  const dustSeed = deriveRoleKey(account, Roles.Dust);
-  const unshieldedKey = deriveRoleKey(account, Roles.NightExternal);
-
+  const keys = derivationResult.keys;
   hdResult.hdWallet.clear();
 
   return {
-    zswapSeed,
-    dustSeed,
-    unshieldedKey,
+    zswapSeed: Buffer.from(keys[Roles.Zswap]),
+    dustSeed: Buffer.from(keys[Roles.Dust]),
+    unshieldedKey: Buffer.from(keys[Roles.NightExternal]),
   };
 };
 
@@ -114,25 +117,76 @@ export const waitForSync = (wallet: WalletFacade): Promise<void> =>
     ),
   );
 
-export const waitForFunds = (wallet: WalletFacade): Promise<void> =>
-  Rx.firstValueFrom(
+export const waitForFunds = (wallet: WalletFacade): Promise<void> => {
+  const nativeRaw = ledger.nativeToken().raw;
+  const asBig = (v: unknown): bigint => {
+    if (typeof v === 'bigint') return v;
+    if (typeof v === 'number' || typeof v === 'string') return BigInt(v);
+    return 0n;
+  };
+  return Rx.firstValueFrom(
     wallet.state().pipe(
-      Rx.throttleTime(10_000),
-      Rx.tap((state) => {
-        const unshielded = (state as any).unshielded?.balances[ledger.nativeToken().raw] ?? 0n;
-        logger.info(`Waiting for funds. Synced: ${state.isSynced}, Balance: ${unshielded}`);
+      Rx.filter((state: any) => {
+        const u = asBig(state.unshielded?.balances?.[nativeRaw]);
+        const s = asBig(state.shielded?.balances?.[nativeRaw]);
+        logger.info(
+          `Waiting for funds. Synced: ${state.isSynced}, Unshielded: ${u}, Shielded: ${s}`,
+        );
+        return state.isSynced && u + s > 0n;
       }),
-      Rx.filter((state) => state.isSynced),
-      Rx.map((s: any) =>
-        (s.unshielded?.balances[ledger.nativeToken().raw] ?? 0n) +
-        (s.shielded?.balances[ledger.nativeToken().raw] ?? 0n),
-      ),
-      Rx.filter((balance) => balance > 0n),
       Rx.map(() => undefined),
     ),
   );
+};
 
 // ─── Wallet Operations ─────────────────────────────────────────────
+
+/**
+ * Register unshielded NIGHT UTXOs for DUST generation. Must be done once
+ * per wallet after receiving NIGHT — without it, the wallet has no DUST
+ * and cannot pay tx fees.
+ */
+export const registerNightForDust = async (
+  walletContext: WalletContext,
+): Promise<boolean> => {
+  const state: any = await Rx.firstValueFrom(
+    walletContext.wallet.state().pipe(Rx.filter((s: any) => s.isSynced)),
+  );
+
+  const unregistered =
+    state.unshielded?.availableCoins?.filter(
+      (coin: any) => coin.meta?.registeredForDustGeneration === false,
+    ) ?? [];
+
+  if (unregistered.length === 0) {
+    const bal = state.dust?.balance?.(new Date()) ?? 0n;
+    logger.info(`no NIGHT UTXOs to register; current DUST: ${bal}`);
+    return bal > 0n;
+  }
+
+  logger.info(`registering ${unregistered.length} NIGHT UTXOs for DUST generation`);
+
+  const recipe = await (walletContext.wallet as any).registerNightUtxosForDustGeneration(
+    unregistered,
+    walletContext.unshieldedKeystore.getPublicKey(),
+    (payload: Uint8Array) => walletContext.unshieldedKeystore.signData(payload),
+  );
+  const finalizedTx = await walletContext.wallet.finalizeRecipe(recipe);
+  await walletContext.wallet.submitTransaction(finalizedTx);
+  logger.info('dust registration tx submitted, waiting for DUST to accrue');
+
+  await Rx.firstValueFrom(
+    walletContext.wallet.state().pipe(
+      Rx.tap((s: any) => {
+        const bal = s.dust?.balance?.(new Date()) ?? 0n;
+        logger.info(`DUST balance: ${bal}`);
+      }),
+      Rx.filter((s: any) => (s.dust?.balance?.(new Date()) ?? 0n) > 0n),
+    ),
+  );
+  logger.info('dust registration complete');
+  return true;
+};
 
 export const sendUnshieldedTransfer = async (
   walletContext: WalletContext,
